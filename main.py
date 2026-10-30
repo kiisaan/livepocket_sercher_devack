@@ -1,20 +1,23 @@
 import asyncio
-import re
 import html
 import json
+import os
+import re
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from playwright.async_api import async_playwright
 
 BASE = "https://livepocket.jp"
 JST = timezone(timedelta(hours=9))
-MAX_LIST_PAGES = 450  # 全ページを巡回する場合の上限
-MAX_DETAIL_FETCHES = 50  # テスト用にまずは50件に制限（本番では増やすか環境変数から取得）
+MAX_LIST_PAGES = 450
+MAX_DETAIL_FETCHES = int(os.environ.get("LIVEPOCKET_MAX_DETAILS", "2500"))
 TTL_BEFORE_SALE = timedelta(days=3)
 TTL_DEFAULT = timedelta(days=7)
 
+
 def _text(fragment: str) -> str:
     return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", fragment))).strip()
+
 
 def _parse_cards(page_html: str) -> list[dict]:
     cards = []
@@ -25,19 +28,22 @@ def _parse_cards(page_html: str) -> list[dict]:
             continue
         title = re.search(r'event-card__title">(.*?)</h3>', card, re.S)
         place = re.search(r'event-card__place">[^<]*</span>(.*?)</p>', card, re.S)
-        cards.append({
-            "path": href.group(1),
-            "title": _text(title.group(1)) if title else "",
-            "tags": sorted(set(re.findall(r'event-card__tag">([^<]+)<', card))),
-            "venue": _text(place.group(1)) if place else "",
-        })
+        cards.append(
+            {
+                "path": href.group(1),
+                "title": _text(title.group(1)) if title else "",
+                "tags": sorted(set(re.findall(r'event-card__tag">([^<]+)<', card))),
+                "venue": _text(place.group(1)) if place else "",
+            }
+        )
     return cards
+
 
 def _parse_tickets(page_html: str) -> list[dict]:
     tickets = []
     ticket_re = re.compile(r'<li class="event-detail-ticket__item[^"]*">(.*?)</a>', re.S)
     datetime_re = re.compile(r"(\d{4})年(\d{1,2})月(\d{1,2})日\([^)]*\)\s*(\d{1,2}):(\d{2})")
-    
+
     for item in ticket_re.findall(page_html):
         title = re.search(r'head__title">(.*?)</h3>', item, re.S)
         order = re.search(r'class="label-(?:order|lottery)[^"]*">([^<]+)<', item)
@@ -47,20 +53,24 @@ def _parse_tickets(page_html: str) -> list[dict]:
         type_ = order.group(1).strip() if order else None
         if type_ and name.startswith(type_):
             name = name[len(type_) :].strip()
-        tickets.append({
-            "name": name,
-            "type": type_,
-            "start": datetime(*map(int, start.groups()), tzinfo=JST).isoformat() if start else None,
-        })
+        tickets.append(
+            {
+                "name": name,
+                "type": type_,
+                "start": datetime(*map(int, start.groups()), tzinfo=JST).isoformat() if start else None,
+            }
+        )
     return tickets
 
-def _load_cache(path: Path) -> dict:
+
+def _load_cache(path: Path | None) -> dict:
     if path and path.exists():
         try:
             return json.loads(path.read_text())
         except ValueError:
             pass
     return {}
+
 
 def _refresh_priority(cached: dict | None, card: dict, now: datetime, today: date) -> int | None:
     if not cached:
@@ -75,9 +85,10 @@ def _refresh_priority(cached: dict | None, card: dict, now: datetime, today: dat
         return 3
     return None
 
-async def collect(target: date, cache_path: Path | None = None) -> list[dict]:
+
+async def _async_collect(target: date, cache_path: Path | None = None) -> list[dict]:
     now = datetime.now(JST)
-    cache = _load_cache(cache_path) if cache_path else {}
+    cache = _load_cache(cache_path)
     events = {}
 
     async with async_playwright() as p:
@@ -91,19 +102,39 @@ async def collect(target: date, cache_path: Path | None = None) -> list[dict]:
         for page_num in range(1, MAX_LIST_PAGES + 1):
             url = f"{BASE}/event/search?sort=1&page={page_num}"
             try:
-                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                await page.wait_for_selector(".event-card-list__item", timeout=15000)
+                response = await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                if response.status != 200:
+                    print(f"[LivePocket] ステータス {response.status} (ページ {page_num})")
+                    break
+                
+                # WAFやJSの描画を考慮して少し待つ
+                await page.wait_for_timeout(2000)
+
+                try:
+                    await page.wait_for_selector(".event-card-list__item", timeout=15000)
+                except Exception as ex:
+                    print(f"[LivePocket] ページ {page_num}: カード要素の待機タイムアウト ({ex})")
+                    break
+
                 html_content = await page.content()
                 cards = _parse_cards(html_content)
                 if not cards:
+                    print(f"[LivePocket] ページ {page_num}: パースされたカードが0件です")
+                    if page_num == 1:
+                        raise RuntimeError("LivePocket の検索結果を取得できませんでした")
                     break
+                
                 for card in cards:
                     events[card["path"]] = card
+                
                 if page_num % 10 == 0:
-                    print(f"[LivePocket] 一覧 {page_num}ページ取得 / 現在 {len(events)}件", flush=True)
-                await asyncio.sleep(0.5)
+                    print(f"[LivePocket] 一覧 {page_num}ページ / {len(events)}件", flush=True)
+                
+                await asyncio.sleep(1)
             except Exception as e:
-                print(f"[LivePocket] 一覧取得終了 (ページ {page_num}): {e}")
+                print(f"[LivePocket] エラー発生 (ページ {page_num}): {e}")
+                if page_num == 1:
+                    raise RuntimeError(f"LivePocket の検索結果を取得できませんでした: {e}")
                 break
 
         print(f"[LivePocket] 一覧から合計 {len(events)}件を取得", flush=True)
@@ -124,10 +155,10 @@ async def collect(target: date, cache_path: Path | None = None) -> list[dict]:
                 tickets = _parse_tickets(detail_html)
                 cache[path] = {"fetched": now.isoformat(), "tags": events[path]["tags"], "tickets": tickets}
                 fetched += 1
-                if fetched % 10 == 0:
+                if fetched % 50 == 0:
                     print(f"[LivePocket] 詳細ページ {fetched}/{min(len(queue), MAX_DETAIL_FETCHES)}件取得", flush=True)
                 await asyncio.sleep(0.5)
-            except Exception:
+            except (OSError, Exception):
                 continue
 
         await browser.close()
@@ -144,25 +175,29 @@ async def collect(target: date, cache_path: Path | None = None) -> list[dict]:
             start = datetime.fromisoformat(ticket["start"]) if ticket.get("start") else None
             if not start or start.date() != target:
                 continue
-            sales.append({
-                "source": "LivePocket",
-                "title": card["title"],
-                "ticket_name": ticket["name"],
-                "type": ticket["type"],
-                "start": start,
-                "venue": card["venue"],
-                "url": BASE + path,
-            })
+            sales.append(
+                {
+                    "source": "LivePocket",
+                    "title": card["title"],
+                    "ticket_name": ticket["name"],
+                    "type": ticket["type"],
+                    "start": start,
+                    "venue": card["venue"],
+                    "url": BASE + path,
+                }
+            )
 
+    print(
+        f"[LivePocket] 詳細ページ取得 {fetched}件（未取得 {max(0, len(queue) - MAX_DETAIL_FETCHES)}件）"
+        f" / 受付情報あり {len(new_cache)}/{len(events)}件 / 本日開始 {len(sales)}件",
+        flush=True,
+    )
     if cache_path:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         cache_path.write_text(json.dumps(new_cache, ensure_ascii=False))
-
-    print(f"[LivePocket] 本日開始の受付: {len(sales)}件", flush=True)
     return sales
 
-if __name__ == "__main__":
-    # 本日から数日後を指定してテスト実行
-    target_date = date.today() + timedelta(days=1)
-    cache_file = Path("cache/livepocket.json")
-    asyncio.run(collect(target_date, cache_file))
+
+def collect(target: date, cache_path: Path | None = None) -> list[dict]:
+    """main.py から同期関数として呼び出されるエントリーポイント"""
+    return asyncio.run(_async_collect(target, cache_path))
