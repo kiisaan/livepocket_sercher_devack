@@ -1,4 +1,5 @@
 import requests
+import re
 
 BASE = "https://livepocket.jp"
 
@@ -11,16 +12,17 @@ def debug_fetch():
     try:
         response = requests.get(url, headers=headers, timeout=10)
         print(f"ステータスコード: {response.status_code}")
-        print(f"レスポンス長: {len(response.text)} 文字")
-        print("--- 先頭300文字のプレビュー ---")
-        print(response.text[:300])
         
-        if response.status_code == 403 or "cloudflare" in response.text.lower():
-            print("⚠️ 注意: Cloudflare等のボットブロックが検出されました。")
-        elif "event-card-list__item" not in response.text:
-            print("⚠️ 注意: 期待するイベントカードのHTML構造が見つかりません。")
-        else:
-            print("✨ 正常にイベント一覧のHTMLが取得できています！")
+        # HTML内にどんなクラス名（class="..."）があるか、それらしいものをいくつか抽出して表示
+        classes = set(re.findall(r'class="([^"]*event[^"]*)"', response.text))
+        print("--- 'event' を含むクラス名の一覧 ---")
+        for c in sorted(classes)[:30]:  # 多すぎるので先頭30個
+            print(f" - {c}")
+            
+        # もし全く見つからない場合はHTML全体の一部をダンプ
+        if not classes:
+            print("--- 'event' を含むクラス名が1つも見つかりませんでした。HTMLの先頭1000文字 ---")
+            print(response.text[:1000])
             
     except Exception as e:
         print(f"❌ エラー発生: {e}")
