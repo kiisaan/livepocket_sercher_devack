@@ -1,40 +1,72 @@
 import asyncio
+import re
+import html
 from playwright.async_api import async_playwright
 
 BASE = "https://livepocket.jp"
+MAX_TEST_PAGES = 3  # まずは動作確認用に最初の3ページまでテスト
 
-async def debug_fetch_playwright():
-    url = f"{BASE}/event/search?sort=1&page=1"
+def _text(fragment: str) -> str:
+    return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", fragment))).strip()
+
+def _parse_cards(page_html: str) -> list[dict]:
+    cards = []
+    # イベントカードのHTMLブロックを抽出
+    card_matches = re.findall(r'<li class="event-card-list__item">(.*?)</li>', page_html, re.S)
+    for card in card_matches:
+        href = re.search(r'href="(/e/[^"]+)"', card)
+        if not href:
+            continue
+        title = re.search(r'event-card__title">(.*?)</h3>', card, re.S)
+        place = re.search(r'event-card__place">[^<]*</span>(.*?)</p>', card, re.S)
+        cards.append({
+            "path": href.group(1),
+            "title": _text(title.group(1)) if title else "",
+            "tags": sorted(set(re.findall(r'event-card__tag">([^<]+)<', card))),
+            "venue": _text(place.group(1)) if place else "",
+        })
+    return cards
+
+async def test_pagination():
     async with async_playwright() as p:
-        # ヘッドレスブラウザを起動（必要に応じて headless=False で視覚的に確認も可能）
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         )
         page = await context.new_page()
-        
-        print(f"Navigating to: {url}")
-        try:
-            # WAFのJSチャレンジが自動実行されるのを待つため、networkidleなどを指定
-            response = await page.goto(url, wait_until="networkidle", timeout=30000)
-            print(f"ステータスコード: {response.status}")
+
+        all_events = {}
+
+        for page_num in range(1, MAX_TEST_PAGES + 1):
+            url = f"{BASE}/event/search?sort=1&page={page_num}"
+            print(f"Fetching ページ {page_num}: {url}")
             
-            # 少し待機してWAFクリア後のコンテンツを描画させる
-            await page.wait_for_timeout(3000)
-            
-            html_content = await page.content()
-            print(f"レスポンスの長さ: {len(html_content)} 文字")
-            
-            # イベントカードが含まれているかチェック
-            if "event-card-list__item" in html_content:
-                print("✨ 成功！WAFを突破し、イベントカードのHTML構造が取得できました！")
-            else:
-                print("⚠️ まだイベントカードが見つかりません。画面のスクリーンショットなどを確認してみてください。")
+            try:
+                response = await page.goto(url, wait_until="networkidle", timeout=30000)
+                if response.status != 200:
+                    print(f"⚠️ ステータスコード {response.status} のため中断します")
+                    break
                 
-        except Exception as e:
-            print(f"❌ エラー発生: {e}")
-        finally:
-            await browser.close()
+                # レスポンスが完全に描画されるのを少し待つ
+                await page.wait_for_timeout(1500)
+                html_content = await page.content()
+                
+                cards = _parse_cards(html_content)
+                print(f" -> 取得成功: {len(cards)}件のカードを検出")
+                
+                if not cards:
+                    print("これ以上カードが見つからないため終了します。")
+                    break
+
+                for card in cards:
+                    all_events[card["path"]] = card
+
+            except Exception as e:
+                print(f"❌ エラー発生 (ページ {page_num}): {e}")
+                break
+
+        await browser.close()
+        print(f"\n✨ テスト完了！合計 {len(all_events)}件のユニークなイベントを集約しました。")
 
 if __name__ == "__main__":
-    asyncio.run(debug_fetch_playwright())
+    asyncio.run(test_pagination())
