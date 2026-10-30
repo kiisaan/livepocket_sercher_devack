@@ -4,14 +4,13 @@ import html
 from playwright.async_api import async_playwright
 
 BASE = "https://livepocket.jp"
-MAX_TEST_PAGES = 3  # まずは動作確認用に最初の3ページまでテスト
+MAX_TEST_PAGES = 3
 
 def _text(fragment: str) -> str:
     return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", fragment))).strip()
 
 def _parse_cards(page_html: str) -> list[dict]:
     cards = []
-    # イベントカードのHTMLブロックを抽出
     card_matches = re.findall(r'<li class="event-card-list__item">(.*?)</li>', page_html, re.S)
     for card in card_matches:
         href = re.search(r'href="(/e/[^"]+)"', card)
@@ -42,24 +41,31 @@ async def test_pagination():
             print(f"Fetching ページ {page_num}: {url}")
             
             try:
-                response = await page.goto(url, wait_until="networkidle", timeout=30000)
-                if response.status != 200:
-                    print(f"⚠️ ステータスコード {response.status} のため中断します")
+                # ページ遷移（domcontentloadedで軽く読み込む）
+                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                
+                # ▼ WAFのクリアとカード要素の描画を待つ（最大15秒）
+                try:
+                    await page.wait_for_selector(".event-card-list__item", timeout=15000)
+                except Exception:
+                    print(f"⚠️ ページ {page_num}: カード要素の待機がタイムアウトしました（ブロックされている可能性があります）")
+                    # 現在のページ内容を少し確認するためにHTMLの長さを出力
+                    content_len = len(await page.content())
+                    print(f"   現在のHTML長: {content_len}文字")
                     break
-                
-                # レスポンスが完全に描画されるのを少し待つ
-                await page.wait_for_timeout(1500)
+
                 html_content = await page.content()
-                
                 cards = _parse_cards(html_content)
                 print(f" -> 取得成功: {len(cards)}件のカードを検出")
                 
                 if not cards:
-                    print("これ以上カードが見つからないため終了します。")
                     break
 
                 for card in cards:
                     all_events[card["path"]] = card
+
+                # サーバーに負荷をかけないよう少しウェイトを入れる
+                await asyncio.sleep(1)
 
             except Exception as e:
                 print(f"❌ エラー発生 (ページ {page_num}): {e}")
